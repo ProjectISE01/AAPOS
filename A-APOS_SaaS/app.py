@@ -43,6 +43,7 @@ def init_session(ds_id: int):
     st.session_state.tick    = 0
     st.session_state.running = False
     st.session_state.kpi_log = []
+    st.session_state.gnn_log_history = []
 
 if "bridge" not in st.session_state:
     init_session(4)
@@ -156,6 +157,15 @@ current_state.update({
     "wip_history": current_state.get("wip_history", []),
     "kpi_history": current_state.get("kpi_history", []),
 })
+
+# GNN 로그 누적
+if "gnn_logs" in current_state:
+    for l in current_state["gnn_logs"]:
+        st.session_state.gnn_log_history.append(l)
+    if len(st.session_state.gnn_log_history) > 60:
+        st.session_state.gnn_log_history = st.session_state.gnn_log_history[-60:]
+
+current_state["gnn_logs"] = list(st.session_state.gnn_log_history)
 
 # KPI 로그 누적
 st.session_state.kpi_log.append({

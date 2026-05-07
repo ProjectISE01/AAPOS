@@ -28,6 +28,8 @@ import numpy as np
 import pandas as pd
 from datetime import datetime
 from .factory_engine import AdvancedStation, Lot, failure_process
+from .gnn_dispatcher import GNNDispatcher
+from .xgb_predictor import XGBBottleneckPredictor
 
 BASE_DATE = datetime(2018, 1, 1)
 
@@ -150,6 +152,8 @@ class SimBridge:
         self.stations: dict[str, AdvancedStation] = {}
         self.active_lots:    list = []
         self.completed_lots: list = []
+        self.gnn_dispatcher = GNNDispatcher()  # GNN 디스패처 초기화
+        self.xgb_predictor  = XGBBottleneckPredictor(threshold=0.7) # XGBoost 예측기 초기화
         self.kpi_tracker = {
             "completed":    0,
             "cycle_times":  [],
@@ -158,6 +162,9 @@ class SimBridge:
         self.wip_history: list = []
         self.kpi_history: list = []
         self._stn_area:   dict[str, str] = {}
+        self.release_events: list = []  # 로트 투입 시점 기록 (최근 투입률 계산용)
+        self.gate_control_active = False # 수문 제어 상태 추적
+        self.gate_logs = [] # 수문 제어 관련 로그 버퍼
 
         # ── 1. Route 파싱 ────────────────────────────────────────────
         self.route_steps: dict[str, list] = {}
@@ -191,6 +198,15 @@ class SimBridge:
         # tool_capacity: {toolgroup: 설비 수} — data_manager에서 tool.txt 파싱
         tool_capacity = data.get("tool_capacity", {})
 
+        # ── 2-1. Station별 Mean PTime 계산 ──────────────────────────
+        stn_ptimes = {}
+        for steps in self.route_steps.values():
+            for s in steps:
+                name = s["station"]
+                if name not in stn_ptimes:
+                    stn_ptimes[name] = []
+                stn_ptimes[name].append(s["ptime"])
+
         for name, cfg in stn_cfg.items():
             # 실제 설비 대수를 capacity로 반영 (없으면 기본값 1)
             capacity = tool_capacity.get(name, 1)
@@ -200,7 +216,11 @@ class SimBridge:
                 is_batch=cfg["is_batch"],
                 batch_min_wafers=cfg["batch_min_wafers"],
                 batch_max_wafers=cfg["batch_max_wafers"],
+                dispatcher=self.gnn_dispatcher # 디스패처 전달
             )
+            # 평균 처리 시간 설정
+            if name in stn_ptimes and stn_ptimes[name]:
+                self.stations[name].mean_ptime = np.mean(stn_ptimes[name])
 
         # ── 3. 고장 프로세스 (DS3, DS4) ─────────────────────────────
         if data.get("downs") is not None:
@@ -213,6 +233,22 @@ class SimBridge:
         # ── 4. Lot 투입 등록 ─────────────────────────────────────────
         if self.route_steps:
             env.process(self._release_controller())
+            # CQT 모니터링 프로세스 (매 1분마다 전역 상태 업데이트 시뮬레이션)
+            env.process(self._cqt_monitor())
+
+    def _cqt_monitor(self):
+        """매 분마다 CQT 상태를 체크하고 UI 로그에 경고 등을 남김 (EWS 개념)"""
+        while True:
+            yield self.env.timeout(1.0)
+            # 사실 GNN에서 실시간 계산하므로 여기선 모니터링용 로그만 처리
+            urgent_count = 0
+            for lot in self.active_lots:
+                if lot.cqt_deadline and lot.cqt_deadline - self.env.now < 30:
+                    urgent_count += 1
+            
+            # 10분마다 브로드캐스트 로그 (예시)
+            if int(self.env.now) % 100 == 0 and urgent_count > 0:
+                pass # UI 로그 등에 추가 가능
 
     def _parse_downcal(self, downs_df) -> dict:
         result = {}
@@ -273,7 +309,7 @@ class SimBridge:
     # ── Lot 투입 컨트롤러 ────────────────────────────────────────────
     def _release_controller(self):
         """order.txt 각 행 → 독립 반복 투입 프로세스 등록"""
-        WIP_LIMIT = 3000
+        BASE_WIP_LIMIT = 3000
         orders    = self.data.get("orders", pd.DataFrame())
         rkeys     = list(self.route_steps.keys())
 
@@ -298,11 +334,52 @@ class SimBridge:
                 self._repeat_release(
                     lot_name, part, priority, wafers,
                     start_min, due_min, repeat,
-                    route_key, WIP_LIMIT
+                    route_key, BASE_WIP_LIMIT
                 )
             )
 
         yield self.env.timeout(0)
+
+    def _get_dynamic_wip_limit(self, base_limit: int) -> int:
+        """
+        [수문 제어 원리] 조건부 WIP 상한 적용
+        특정 구역(Litho, Implant 등)의 Down 설비가 많으면 전체 투입을 억제함.
+        """
+        current_wip_limit = base_limit
+        
+        # 구역별 상태 집계
+        area_down_counts = {}
+        for name, stn in self.stations.items():
+            if stn.is_down:
+                area = self._stn_area.get(name, "Unknown")
+                area_down_counts[area] = area_down_counts.get(area, 0) + 1
+        
+        # 임계값 설정
+        critical_areas = ["Litho", "Implant", "Diffusion"]
+        max_down_impact = 0
+        culprit_area = ""
+        for area in critical_areas:
+            down_count = area_down_counts.get(area, 0)
+            if down_count >= 2: # 임계값: 2대 이상 고장 시
+                max_down_impact = max(max_down_impact, 0.2)
+                culprit_area = area
+            elif down_count >= 1: # 1대 고장 시 소폭 억제
+                max_down_impact = max(max_down_impact, 0.05)
+                if not culprit_area: culprit_area = area
+                
+        if max_down_impact > 0:
+            current_wip_limit = int(base_limit * (1.0 - max_down_impact))
+            if not self.gate_control_active:
+                self.gate_control_active = True
+                msg = f"🚧 [Gate Control] Active: {culprit_area} failure detected. WIP Limit throttled to {current_wip_limit}."
+                self.gate_logs.append(msg)
+        else:
+            if self.gate_control_active:
+                self.gate_control_active = False
+                msg = f"🔓 [Gate Control] Deactivated: All critical areas recovered. WIP Limit restored to {base_limit}."
+                self.gate_logs.append(msg)
+            
+        return current_wip_limit
 
     def _find_route(self, part: str, rkeys: list) -> str:
         """Product_1 -> part_1 -> route_steps 키 탐색"""
@@ -338,9 +415,12 @@ class SimBridge:
         lot_due_duration = max(1.0, due_min - start_min)
 
         while True:
-            # WIP 상한 초과 시 대기
-            while len(self.active_lots) >= wip_limit:
+            # WIP 상한 초과 시 대기 (수문 제어: 동적 상한 적용)
+            current_limit = self._get_dynamic_wip_limit(wip_limit)
+            while len(self.active_lots) >= current_limit:
                 yield self.env.timeout(repeat_interval)
+                # 대기 중에도 상한선은 변할 수 있으므로 갱신
+                current_limit = self._get_dynamic_wip_limit(wip_limit)
 
             lot = Lot(
                 lot_id    = f"{lot_name}_{counter:05d}",
@@ -350,27 +430,88 @@ class SimBridge:
                 wafers    = wafers,
                 due_date  = self.env.now + lot_due_duration,
             )
+            # CQT 데드라인 설정 (시뮬레이션: 전체 공정 시간의 약 80% 지점을 데드라인으로 설정)
+            lot.cqt_deadline = self.env.now + (lot_due_duration * 0.8)
+            
             counter += 1
             self.active_lots.append(lot)
+            self.release_events.append(self.env.now)
+            # 최근 1시간(60분) 데이터만 유지
+            if len(self.release_events) > 1000:
+                self.release_events = [t for t in self.release_events if t > self.env.now - 60]
+
             self.env.process(
                 self._lot_process(lot, self.route_steps[route_key])
             )
             yield self.env.timeout(repeat_interval)
 
+    def get_snapshot(self) -> dict:
+        """강화학습 또는 분석을 위한 핵심 피처 추출"""
+        now = self.env.now
+        
+        # 1. 시뮬레이션 시간
+        snapshot = {
+            "time": now,
+            "stations": {},
+            "release_rate": 0.0
+        }
+        
+        # 2~4. 설비별 정보 (대기열, 상태, 고장 후 경과 시간)
+        for name, stn in self.stations.items():
+            # 상태 매핑: down -> Down, busy/setup -> Running, idle -> Idle
+            raw_state = stn.state
+            if raw_state == "down":
+                status = "Down"
+            elif raw_state in ("busy", "setup"):
+                status = "Running"
+            else:
+                status = "Idle"
+
+            snapshot["stations"][name] = {
+                "queue_size": stn.queue_size,
+                "status": status,
+                "time_since_last_failure": stn.time_since_last_failure
+            }
+            
+        # 5. 현재 투입률 (최근 60분간 투입된 로트 수 -> 시간당 환산)
+        recent_releases = [t for t in self.release_events if t > now - 60]
+        self.release_events = recent_releases # 관리용 리스트 갱신
+        
+        if now > 0:
+            window = min(60.0, now)
+            snapshot["release_rate"] = round(len(recent_releases) * (60.0 / window), 2)
+        else:
+            snapshot["release_rate"] = 0.0
+        
+        return snapshot
+
     # ── UI 상태 추출 ─────────────────────────────────────────────────
     def update_ui_state(self) -> dict:
         stn_states = []
         area_stats: dict[str, dict] = {}
+        gnn_logs = []
 
         for name, stn in self.stations.items():
             state = stn.state
             area  = self._stn_area.get(name, "Dry_Etch")
             stn_states.append({"id": name, "state": state,
                                 "util": stn.utilization, "area": area})
+            
+            # GNN/CQT 로그 수집 (최근 로그 위주)
+            if hasattr(stn, 'action_logs') and stn.action_logs:
+                gnn_logs.extend(stn.action_logs)
+                stn.action_logs = [] # 읽은 로그 비우기
+
             if area not in area_stats:
-                area_stats[area] = {"busy":0,"down":0,"setup":0,"idle":0,"total":0}
+                area_stats[area] = {"busy":0,"down":0,"setup":0,"idle":0,"total":0, "wip": 0}
             area_stats[area][state] += 1
             area_stats[area]["total"] += 1
+
+        # 구역별 WIP 합산
+        for lot in self.active_lots:
+            area = self._stn_area.get(lot.current_station, "Unknown")
+            if area in area_stats:
+                area_stats[area]["wip"] += 1
 
         lot_info = []
         for lot in self.active_lots[:50]:
@@ -397,16 +538,33 @@ class SimBridge:
         down_count = sum(1 for s in stn_states if s["state"] == "down")
         wip        = len(self.active_lots)
         tick       = int(self.env.now)
+        current_wip_limit = self._get_dynamic_wip_limit(3000) # 기본 3000 기준 (여기서 로그 발생 가능)
 
-        self.wip_history.append({"tick": tick, "wip": wip})
+        self.wip_history.append({"tick": tick, "wip": wip, "limit": current_wip_limit})
         self.kpi_history.append({"tick": tick, "ct": avg_ct, "ontime": ontime_pct})
         if len(self.wip_history) > 60: self.wip_history = self.wip_history[-60:]
         if len(self.kpi_history) > 60: self.kpi_history = self.kpi_history[-60:]
+
+        # XGBoost 병목 예측
+        # 현재 상태를 snapshot 형태로 구성
+        snapshot = {
+            "area_stats": area_stats,
+            "wip": len(self.active_lots),
+            "tick": self.env.now
+        }
+        xgb_probs, xgb_logs = self.xgb_predictor.predict(snapshot)
+        
+        # 모든 로그 통합 (GNN + XGB + Gate Control)
+        gnn_logs.extend(xgb_logs)
+        gnn_logs.extend(self.gate_logs)
+        self.gate_logs = [] # 읽은 로그 비우기
 
         return {
             "tick": tick, "wip": wip,
             "stations": stn_states, "area_stats": area_stats,
             "lot_info": lot_info,
+            "gnn_logs": gnn_logs,
+            "xgb_probs": xgb_probs, # 구역별 병목 확률 추가
             "kpi": {"completed": completed, "avg_ct": avg_ct,
                     "ontime_pct": ontime_pct, "down_count": down_count},
             "wip_history": self.wip_history[-30:],

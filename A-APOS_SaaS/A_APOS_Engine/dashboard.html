@@ -152,6 +152,15 @@ body::before {
 .area-card-stats .busy { color: var(--cyan); }
 .area-card-stats .down { color: var(--red); }
 .area-card.has-down { border-color: rgba(255,63,63,0.35); }
+.alert-pulse {
+  animation: alert-border-pulse 1.5s infinite;
+  border-color: var(--red) !important;
+}
+@keyframes alert-border-pulse {
+  0% { box-shadow: 0 0 0 0 rgba(239,68,68,0.4); }
+  70% { box-shadow: 0 0 0 6px rgba(239,68,68,0); }
+  100% { box-shadow: 0 0 0 0 rgba(239,68,68,0); }
+}
 .area-card.has-down::before {
   content: ''; position: absolute; top: 0; right: 0;
   width: 0; height: 0;
@@ -585,16 +594,20 @@ function buildAreaGrid() {
   D.areas.forEach(a => {
     const state = areaMap[a.name] || { busy: Math.round(a.toolgroups*0.6), down: 0, setup: Math.round(a.toolgroups*0.1), total: a.toolgroups };
     const util = Math.round((state.busy / state.total)*100);
+    const prob = (D.xgb_probs && D.xgb_probs[a.name]) ? Math.round(D.xgb_probs[a.name] * 100) : 0;
     const card = document.createElement('div');
-    card.className = 'area-card' + (state.down > 0 ? ' has-down' : '');
+    card.className = 'area-card' + (state.down > 0 ? ' has-down' : '') + (prob >= 70 ? ' alert-pulse' : '');
     card.dataset.area = a.name;
     card.innerHTML = `
-      <div class="area-card-name">${a.name}</div>
+      <div style="display:flex;justify-content:space-between;align-items:center;">
+        <div class="area-card-name">${a.name}</div>
+        <div style="font-size:10px;font-weight:bold;color:${prob>=70?'var(--red)':prob>40?'var(--amber)':'var(--txt3)'}">${prob}% Prob.</div>
+      </div>
       <div class="area-card-bar-wrap">
         <div class="area-card-bar" style="width:${util}%;background:${util>80?'var(--red)':util>50?'var(--amber)':'var(--cyan)'}"></div>
       </div>
       <div class="area-card-stats">
-        <span class="busy">${a.toolgroups} TG · ${util}%</span>
+        <span class="busy">${a.toolgroups} TG · Util: ${util}%</span>
         ${state.down>0?`<span class="down">↓${state.down}</span>`:''}
       </div>`;
     card.onclick = () => filterByArea(a.name, card);
@@ -804,11 +817,7 @@ function addLog(msg, type='') {
   if (consoleEl.children.length > 60) consoleEl.removeChild(consoleEl.firstChild);
 }
 
-/* Initial logs */
-setTimeout(() => addLog('> System initialized · Dataset: ' + D.ds_name, 'ai'), 200);
-setTimeout(() => addLog('> SimPy environment ready · ' + NUM_STNS + ' stations loaded', ''), 600);
-setTimeout(() => addLog('> Breakdown risk analysis complete · ' + D.breakdown.length + ' areas monitored', ''), 1000);
-setTimeout(() => addLog('> GNN agent standby · awaiting simulation tick', 'ai'), 1500);
+/* Initial logs removed to avoid duplicates on rerun */
 
 /* ─── POPUP ─── */
 let popChart = null;
@@ -908,10 +917,10 @@ setInterval(() => {
   // Area grid pulse
   buildAreaGrid();
 
-  // Console log
-  if (Math.random() > 0.55) {
+  // Console log (Demo logs only if no real logs were initially provided)
+  if (Math.random() > 0.85) {
     const [tmpl, type] = actionPool[Math.floor(Math.random()*actionPool.length)];
-    const area = D.areas[Math.floor(Math.random()*D.areas.length)].name;
+    const area = D.areas && D.areas.length ? D.areas[Math.floor(Math.random()*D.areas.length)].name : 'Diffusion';
     const msg = tmpl
       .replace('{l}', Math.round(2000+Math.random()*500))
       .replace('{s}', Math.round(Math.random()*NUM_STNS))
@@ -920,7 +929,7 @@ setInterval(() => {
       .replace('{b}', [50,75,100,125][Math.floor(Math.random()*4)])
       .replace('{t}', Math.round(30+Math.random()*90))
       .replace('{d}', Math.round(5+Math.random()*25))
-      .replace('{tg}', D.areas[Math.floor(Math.random()*D.areas.length)].name)
+      .replace('{tg}', area)
       .replace('{pct}', (Math.random()*5+1).toFixed(1));
     addLog('> ' + msg, type);
   }
@@ -938,6 +947,14 @@ buildAreaGrid();
 buildBreakdownTable();
 buildProductTable();
 buildBNCandidates();
+
+/* Process initial GNN logs immediately */
+if (D.gnn_logs && D.gnn_logs.length > 0) {
+  while (D.gnn_logs.length > 0) {
+    const msg = D.gnn_logs.shift();
+    addLog('> ' + msg, 'ai');
+  }
+}
 
 /* ─── app.py FULL UPDATE HOOK ─── */
 // Called by Streamlit via postMessage when new sim data arrives
