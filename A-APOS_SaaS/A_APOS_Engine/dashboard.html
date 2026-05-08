@@ -99,7 +99,7 @@ body::before {
 .ds-tick .tick-label { font-size: 9px; color: var(--txt3); }
 
 /* ─── KPI ROW ─── */
-.kpi-row { display: grid; grid-template-columns: repeat(5, 1fr); gap: 8px; margin-bottom: 12px; }
+.kpi-row { display: grid; grid-template-columns: repeat(6, 1fr); gap: 8px; margin-bottom: 12px; }
 .kpi {
   background: var(--surface);
   border: 1px solid var(--border);
@@ -332,6 +332,11 @@ body::before {
       <div class="kpi-sub">lots in queue</div>
     </div>
     <div class="kpi" style="--accent-color: var(--red)">
+      <div class="kpi-label">CQT Violations</div>
+      <div class="kpi-val" id="kpi-cqt" style="color:var(--red)">—</div>
+      <div class="kpi-sub">urgent: <span id="kpi-cqt-urgent">—</span></div>
+    </div>
+    <div class="kpi" style="--accent-color: var(--amber)">
       <div class="kpi-label">Down Alerts</div>
       <div class="kpi-val" id="kpi-down">—</div>
       <div class="kpi-sub">critical stations</div>
@@ -401,6 +406,22 @@ body::before {
         </table>
       </div>
 
+      <!-- BENCHMARK ARENA HEATMAP -->
+      <div class="breakdown-wrap">
+        <div class="sec-label">Benchmark Arena — Dispatching Policy Performance Comparison</div>
+        <div id="benchmark-heatmap" style="margin-top:10px; display:grid; grid-template-columns: repeat(5, 1fr); gap:1px; background:var(--border); border:1px solid var(--border);">
+          <!-- Header -->
+          <div style="background:var(--surface2); padding:8px; font-size:9px; color:var(--txt3);">POLICY</div>
+          <div style="background:var(--surface2); padding:8px; font-size:9px; color:var(--txt3);">Cycle Time (Avg)</div>
+          <div style="background:var(--surface2); padding:8px; font-size:9px; color:var(--txt3);">On-time Pct</div>
+          <div style="background:var(--surface2); padding:8px; font-size:9px; color:var(--txt3);">WIP Avg</div>
+          <div style="background:var(--surface2); padding:8px; font-size:9px; color:var(--txt3);">Score</div>
+          
+          <!-- Rows will be injected here -->
+        </div>
+        <div style="margin-top:8px; font-size:9px; color:var(--txt2);">* 각 정책별 시뮬레이션 결과가 히트맵으로 누적 비교됩니다. (Green = Best)</div>
+      </div>
+
     </div>
 
     <!-- RIGHT COLUMN -->
@@ -421,6 +442,12 @@ body::before {
       <div class="chart-wrap">
         <div class="sec-label">구역별 WIP 분포</div>
         <canvas id="area-donut" height="140"></canvas>
+      </div>
+
+      <!-- CQT URGENCY LIST -->
+      <div class="breakdown-wrap">
+        <div class="sec-label">CQT 긴급 로트 현황 <span style="color:var(--red);margin-left:4px">(CQT Urgency)</span></div>
+        <div id="cqt-list" style="margin-top:6px; font-size:9px; max-height:120px; overflow-y:auto;"></div>
       </div>
 
       <!-- BN CANDIDATE LIST -->
@@ -578,25 +605,17 @@ document.getElementById('node-map-title').textContent = `전체 설비 ${NUM_STN
 function buildAreaGrid() {
   const container = document.getElementById('area-grid');
   container.innerHTML = '';
-  const areaMap = {};
-  stnStates.forEach((s, i) => {
-    const name = (D.stn_names && D.stn_names[i]) || '';
-    // guess area from name prefix
-    const area = guessArea(name, i);
-    if (!areaMap[area]) areaMap[area] = { busy:0, down:0, setup:0, total:0 };
-    areaMap[area].total++;
-    if (s==='busy') areaMap[area].busy++;
-    if (s==='down') areaMap[area].down++;
-    if (s==='setup') areaMap[area].setup++;
-  });
+  
+  // Use real area stats if available, else fallback to guess from stations
+  const areaStats = D.area_stats || {};
 
-  // Use static areas if available
   D.areas.forEach(a => {
-    const state = areaMap[a.name] || { busy: Math.round(a.toolgroups*0.6), down: 0, setup: Math.round(a.toolgroups*0.1), total: a.toolgroups };
-    const util = Math.round((state.busy / state.total)*100);
+    const stats = areaStats[a.name] || { busy: 0, down: 0, setup: 0, total: a.toolgroups, wip: 0, avg_util: 0 };
+    const util = stats.avg_util !== undefined ? stats.avg_util : Math.round((stats.busy / (stats.total || 1))*100);
     const prob = (D.xgb_probs && D.xgb_probs[a.name]) ? Math.round(D.xgb_probs[a.name] * 100) : 0;
+    
     const card = document.createElement('div');
-    card.className = 'area-card' + (state.down > 0 ? ' has-down' : '') + (prob >= 70 ? ' alert-pulse' : '');
+    card.className = 'area-card' + (stats.down > 0 ? ' has-down' : '') + (prob >= 70 ? ' alert-pulse' : '');
     card.dataset.area = a.name;
     card.innerHTML = `
       <div style="display:flex;justify-content:space-between;align-items:center;">
@@ -608,7 +627,8 @@ function buildAreaGrid() {
       </div>
       <div class="area-card-stats">
         <span class="busy">${a.toolgroups} TG · Util: ${util}%</span>
-        ${state.down>0?`<span class="down">↓${state.down}</span>`:''}
+        <span style="color:var(--amber);margin-left:4px">WIP: ${stats.wip}</span>
+        ${stats.down>0?`<span class="down">↓${stats.down}</span>`:''}
       </div>`;
     card.onclick = () => filterByArea(a.name, card);
     container.appendChild(card);
@@ -728,9 +748,37 @@ function updateKPIs(d) {
   document.getElementById('kpi-res').textContent = resScore.toFixed(1);
   document.getElementById('kpi-res-sub').textContent = resScore > 90 ? 'Stability: HIGH' : resScore > 75 ? 'Stability: MED' : 'Stability: LOW';
   document.getElementById('kpi-wip').textContent = (d.wip || wipHistory[wipHistory.length-1]).toLocaleString();
+  
+  // CQT 데이터 업데이트
+  const cqtV = (d.cqt && d.cqt.violations) || 0;
+  const cqtU = (d.cqt && d.cqt.urgent_count) || 0;
+  document.getElementById('kpi-cqt').textContent = cqtV;
+  document.getElementById('kpi-cqt-urgent').textContent = cqtU;
+
   const downCnt = stnStates.filter(s => s === 'down').length;
   document.getElementById('kpi-down').textContent = downCnt;
   document.getElementById('kpi-tput').textContent = (Math.round(82 + Math.random()*6)) + '';
+}
+
+/* ─── CQT LIST ─── */
+function buildCQTList() {
+  const container = document.getElementById('cqt-list');
+  const urgent = (D.cqt && D.cqt.urgent_list) || [];
+  container.innerHTML = '';
+  if (!urgent.length) {
+    container.innerHTML = '<div style="color:var(--txt3);text-align:center;padding:10px;">No urgent lots</div>';
+    return;
+  }
+  urgent.forEach(lot => {
+    const item = document.createElement('div');
+    item.style.cssText = 'display:flex;justify-content:space-between;padding:4px 0;border-bottom:1px solid rgba(255,255,255,0.03);';
+    item.innerHTML = `
+      <span style="color:var(--cyan)">${lot.id}</span>
+      <span style="color:var(--txt3)">${lot.area}</span>
+      <span style="color:var(--red)">${lot.rem}m left</span>
+    `;
+    container.appendChild(item);
+  });
 }
 
 /* ─── CHART: WIP ─── */
@@ -916,6 +964,7 @@ setInterval(() => {
 
   // Area grid pulse
   buildAreaGrid();
+  buildCQTList();
 
   // Console log (Demo logs only if no real logs were initially provided)
   if (Math.random() > 0.85) {
@@ -940,10 +989,69 @@ setInterval(() => {
   document.getElementById('live-clock').textContent = new Date().toLocaleTimeString('ko-KR');
 }, 1000);
 
+/* ─── BENCHMARK HEATMAP ─── */
+function buildBenchmarkHeatmap() {
+  const container = document.getElementById('benchmark-heatmap');
+  const policies = ["GNN", "FIFO", "EDD", "CR"];
+  const bData = D.benchmark || {};
+  
+  // Clean existing rows (keep header)
+  const headerCount = 5;
+  while (container.children.length > headerCount) {
+    container.removeChild(container.lastChild);
+  }
+
+  // Find min/max for coloring
+  const cts = Object.values(bData).map(d => d.ct).filter(v => v > 0);
+  const ots = Object.values(bData).map(d => d.ontime).filter(v => v > 0);
+  const minCT = Math.min(...cts);
+  const maxOT = Math.max(...ots);
+
+  policies.forEach(p => {
+    const data = bData[p] || { ct: 0, ontime: 0 };
+    const ctVal = data.ct ? data.ct.toFixed(1) + 'h' : '—';
+    const otVal = data.ontime ? data.ontime.toFixed(1) + '%' : '—';
+    
+    // Policy Name
+    const pEl = document.createElement('div');
+    pEl.style.cssText = `background:var(--surface); padding:8px; font-size:10px; font-weight:bold; color:${p==='GNN'?'var(--cyan)':'var(--txt)'}; border-left: 2px solid ${p==='GNN'?'var(--cyan)':'transparent'};`;
+    pEl.textContent = p;
+    container.appendChild(pEl);
+
+    // CT (Lower is better)
+    const ctEl = document.createElement('div');
+    const ctColor = data.ct > 0 ? (data.ct === minCT ? 'var(--green-dim)' : 'var(--surface)') : 'var(--surface)';
+    ctEl.style.cssText = `background:${ctColor}; padding:8px; font-size:10px; color:${data.ct===minCT?'var(--green)':'var(--txt)'};`;
+    ctEl.textContent = ctVal;
+    container.appendChild(ctEl);
+
+    // OT (Higher is better)
+    const otEl = document.createElement('div');
+    const otColor = data.ontime > 0 ? (data.ontime === maxOT ? 'var(--green-dim)' : 'var(--surface)') : 'var(--surface)';
+    otEl.style.cssText = `background:${otColor}; padding:8px; font-size:10px; color:${data.ontime===maxOT?'var(--green)':'var(--txt)'};`;
+    otEl.textContent = otVal;
+    container.appendChild(otEl);
+
+    // WIP (Approx)
+    const wipEl = document.createElement('div');
+    wipEl.style.cssText = `background:var(--surface); padding:8px; font-size:10px; color:var(--txt3);`;
+    wipEl.textContent = data.ct > 0 ? Math.round(D.wip * (data.ct/D.baseline)) : '—';
+    container.appendChild(wipEl);
+
+    // Score (Rank)
+    const scEl = document.createElement('div');
+    scEl.style.cssText = `background:var(--surface); padding:8px; font-size:10px; color:var(--purple);`;
+    scEl.textContent = data.ct > 0 ? (data.ct === minCT ? 'BEST' : 'RANK ' + (cts.filter(v => v < data.ct).length + 1)) : '—';
+    container.appendChild(scEl);
+  });
+}
+
 /* ─── INIT ─── */
 updateHeader(D);
 updateKPIs(D);
 buildAreaGrid();
+buildCQTList();
+buildBenchmarkHeatmap();
 buildBreakdownTable();
 buildProductTable();
 buildBNCandidates();
@@ -961,8 +1069,11 @@ if (D.gnn_logs && D.gnn_logs.length > 0) {
 window.addEventListener('message', (e) => {
   if (e.data && e.data.type === 'apos_update') {
     const nd = e.data.payload;
+    D = Object.assign({}, D, nd); // 전역 데이터 업데이트
+    
     tick = nd.tick || tick;
     document.getElementById('tick-display').textContent = 'T+' + tick;
+    
     if (nd.stations && nd.stations.length) {
       nd.stations.forEach((s, i) => {
         stnStates[i] = s.state;
@@ -975,13 +1086,31 @@ window.addEventListener('message', (e) => {
       stateChart.data.datasets[0].data = [cc.busy, cc.setup, cc.down, cc.idle];
       stateChart.update();
     }
+    
     if (nd.wip !== undefined) {
       wipHistory.push(nd.wip); wipHistory.shift();
       wipChart.data.datasets[0].data = [...wipHistory];
       wipChart.update();
-      document.getElementById('kpi-wip').textContent = nd.wip.toLocaleString();
     }
+    
+    updateKPIs(D);
+    buildAreaGrid();
+    buildCQTList();
+    buildBenchmarkHeatmap();
+    
     if (nd.action_log) addLog('> ' + nd.action_log, 'ai');
+    if (nd.gnn_logs) {
+      nd.gnn_logs.forEach(msg => addLog('> ' + msg, 'ai'));
+    }
+
+    // XGBoost 병목 경고 로그 (확률 70% 초과 시)
+    if (nd.xgb_probs) {
+      Object.entries(nd.xgb_probs).forEach(([area, prob]) => {
+        if (prob > 0.7) {
+          addLog(`!! CRITICAL: ${area} bottleneck probability ${Math.round(prob*100)}% !!`, 'err');
+        }
+      });
+    }
   }
 });
 </script>

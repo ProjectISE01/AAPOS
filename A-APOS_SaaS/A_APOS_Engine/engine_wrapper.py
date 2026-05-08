@@ -146,13 +146,18 @@ def _parse_route_df(df: pd.DataFrame) -> list:
 
 
 class SimBridge:
-    def __init__(self, env: simpy.Environment, data: dict):
+    def __init__(self, env: simpy.Environment, data: dict, overrides: dict = None):
         self.env            = env
         self.data           = data
+        self.overrides      = overrides or {}
         self.stations: dict[str, AdvancedStation] = {}
         self.active_lots:    list = []
         self.completed_lots: list = []
-        self.gnn_dispatcher = GNNDispatcher()  # GNN 디스패처 초기화
+        
+        # 디스패칭 정책 설정 (기본값: GNN)
+        policy = self.overrides.get("policy", "GNN")
+        self.gnn_dispatcher = GNNDispatcher(policy=policy) 
+        
         self.xgb_predictor  = XGBBottleneckPredictor(threshold=0.7) # XGBoost 예측기 초기화
         self.kpi_tracker = {
             "completed":    0,
@@ -197,6 +202,7 @@ class SimBridge:
 
         # tool_capacity: {toolgroup: 설비 수} — data_manager에서 tool.txt 파싱
         tool_capacity = data.get("tool_capacity", {})
+        cap_factor = self.overrides.get("capacity_factor", 1.0)
 
         # ── 2-1. Station별 Mean PTime 계산 ──────────────────────────
         stn_ptimes = {}
@@ -209,7 +215,9 @@ class SimBridge:
 
         for name, cfg in stn_cfg.items():
             # 실제 설비 대수를 capacity로 반영 (없으면 기본값 1)
-            capacity = tool_capacity.get(name, 1)
+            raw_cap = tool_capacity.get(name, 1)
+            capacity = max(1, int(raw_cap * cap_factor))
+            
             self.stations[name] = AdvancedStation(
                 env, name,
                 capacity=capacity,
@@ -224,10 +232,18 @@ class SimBridge:
 
         # ── 3. 고장 프로세스 (DS3, DS4) ─────────────────────────────
         if data.get("downs") is not None:
+            mttf_factor = self.overrides.get("mttf_factor", 1.0)
+            mttr_factor = self.overrides.get("mttr_factor", 1.0)
+            
             area_bd = self._parse_downcal(data["downs"])
             for stn_name, stn_obj in self.stations.items():
                 area = self._stn_area.get(stn_name, "Dry_Etch")
                 mttf, mttr = area_bd.get(area, BREAKDOWN_TABLE.get(area, (10080, 200)))
+                
+                # Overrides 적용
+                mttf *= mttf_factor
+                mttr *= mttr_factor
+                
                 env.process(failure_process(env, stn_obj, mttf, mttr))
 
         # ── 4. Lot 투입 등록 ─────────────────────────────────────────
@@ -309,7 +325,7 @@ class SimBridge:
     # ── Lot 투입 컨트롤러 ────────────────────────────────────────────
     def _release_controller(self):
         """order.txt 각 행 → 독립 반복 투입 프로세스 등록"""
-        BASE_WIP_LIMIT = 3000
+        BASE_WIP_LIMIT = self.overrides.get("wip_limit", 3000)
         orders    = self.data.get("orders", pd.DataFrame())
         rkeys     = list(self.route_steps.keys())
 
@@ -507,11 +523,35 @@ class SimBridge:
             area_stats[area][state] += 1
             area_stats[area]["total"] += 1
 
-        # 구역별 WIP 합산
+        # 구역별 WIP 및 Utilization 합산
+        area_utils_sum: dict[str, list] = {}
+        for name, stn in self.stations.items():
+            area = self._stn_area.get(name, "Dry_Etch")
+            if area not in area_utils_sum: area_utils_sum[area] = []
+            area_utils_sum[area].append(stn.utilization)
+
+        # CQT 위반 현황 계산
+        cqt_violations = 0
+        urgent_lots = []
         for lot in self.active_lots:
             area = self._stn_area.get(lot.current_station, "Unknown")
             if area in area_stats:
                 area_stats[area]["wip"] += 1
+            
+            if lot.cqt_deadline:
+                if self.env.now > lot.cqt_deadline:
+                    cqt_violations += 1
+                elif lot.cqt_deadline - self.env.now < 120: # 2시간 이내 긴급
+                    urgent_lots.append({
+                        "id": lot.id,
+                        "area": area,
+                        "rem": round(lot.cqt_deadline - self.env.now, 1)
+                    })
+
+        # 구역별 평균 가동률 계산
+        for area, utils in area_utils_sum.items():
+            if area in area_stats:
+                area_stats[area]["avg_util"] = round(float(np.mean(utils)), 1)
 
         lot_info = []
         for lot in self.active_lots[:50]:
@@ -567,6 +607,11 @@ class SimBridge:
             "xgb_probs": xgb_probs, # 구역별 병목 확률 추가
             "kpi": {"completed": completed, "avg_ct": avg_ct,
                     "ontime_pct": ontime_pct, "down_count": down_count},
+            "cqt": {
+                "violations": cqt_violations,
+                "urgent_count": len(urgent_lots),
+                "urgent_list": urgent_lots[:10]
+            },
             "wip_history": self.wip_history[-30:],
             "kpi_history": self.kpi_history[-30:],
         }
